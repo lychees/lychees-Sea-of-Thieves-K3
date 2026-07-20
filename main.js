@@ -205,7 +205,6 @@ scene.add(ocean);
 
 // ---------- Materials ----------
 const MAT = {
-  hull: new THREE.MeshStandardMaterial({ color: 0x5a3a22, roughness: 0.85 }),
   hullDark: new THREE.MeshStandardMaterial({ color: 0x3c2716, roughness: 0.9 }),
   deck: new THREE.MeshStandardMaterial({ color: 0x8a6a42, roughness: 0.9 }),
   mast: new THREE.MeshStandardMaterial({ color: 0x4a3018, roughness: 0.85 }),
@@ -222,113 +221,223 @@ const MAT = {
   flag: new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 1, side: THREE.DoubleSide }),
 };
 
-// ---------- Ship builder ----------
-function buildShip({ enemy = false, remote = false, cannons = 3, scale = 1 } = {}) {
-  const ship = new THREE.Group();
+// ---------- Ship models ----------
+// Per-class hull configs: every ship class gets its own distinct model.
+const HULL_CONFIGS = {
+  sloop: {
+    len: 9, beam: 3.0, h: 2.0, color: 0x6a452a,
+    masts: [{ x: 0.8, h: 8, sailW: 4.2, sailH: 4.4 }],
+    stern: { w: 1.8, h: 1.0, d: 2.4 }, fore: null, gunDecks: 1,
+  },
+  brig: {
+    len: 10, beam: 3.2, h: 2.2, color: 0x5a3a22,
+    masts: [{ x: 1.6, h: 8.5, sailW: 4.6, sailH: 4.2 }, { x: -2.2, h: 7, sailW: 3.8, sailH: 3.4 }],
+    stern: { w: 2.2, h: 1.4, d: 2.8 }, fore: null, gunDecks: 1,
+  },
+  galleon: {
+    len: 12, beam: 3.8, h: 2.6, color: 0x6b4226,
+    masts: [{ x: 3.2, h: 9.5, sailW: 5.0, sailH: 4.6 }, { x: 0, h: 10.5, sailW: 5.4, sailH: 5.0 }, { x: -3.6, h: 8, sailW: 4.2, sailH: 3.8 }],
+    stern: { w: 2.8, h: 2.6, d: 3.2 }, fore: { w: 1.8, h: 1.3, d: 2.8 }, gunDecks: 1,
+  },
+  manowar: {
+    len: 13, beam: 4.2, h: 2.8, color: 0x3a2a1e,
+    masts: [{ x: 3.6, h: 10, sailW: 5.4, sailH: 4.8 }, { x: 0, h: 11, sailW: 5.8, sailH: 5.4 }, { x: -4, h: 8.6, sailW: 4.6, sailH: 4.0 }],
+    stern: { w: 3.0, h: 2.4, d: 3.4 }, fore: { w: 2.0, h: 1.5, d: 3.0 }, gunDecks: 2,
+  },
+};
 
-  // Hull: tapered box via extruded shape
-  const hullShape = new THREE.Shape();
-  hullShape.moveTo(-4.5, 0);
-  hullShape.lineTo(-3.4, 1.6);
-  hullShape.lineTo(3.2, 1.6);
-  hullShape.quadraticCurveTo(5.2, 0.9, 5.6, 0);
-  hullShape.quadraticCurveTo(5.2, -0.9, 3.2, -1.6);
-  hullShape.lineTo(-3.4, -1.6);
-  hullShape.closePath();
-  const hullGeo = new THREE.ExtrudeGeometry(hullShape, { depth: 2.2, bevelEnabled: false });
-  hullGeo.rotateX(Math.PI / 2); // shape XY -> XZ, extrude becomes height
-  hullGeo.translate(0, 2.2, 0);
-  const hull = new THREE.Mesh(hullGeo, MAT.hull);
+// tapered hull extruded from a ship-outline shape
+function makeHullGeo(len, beam, h) {
+  const L = len / 2, B = beam / 2;
+  const s = new THREE.Shape();
+  s.moveTo(-L, 0);
+  s.lineTo(-L * 0.75, B);
+  s.lineTo(L * 0.57, B);
+  s.quadraticCurveTo(L * 0.93, B * 0.55, L, 0);
+  s.quadraticCurveTo(L * 0.93, -B * 0.55, L * 0.57, -B);
+  s.lineTo(-L * 0.75, -B);
+  s.closePath();
+  const g = new THREE.ExtrudeGeometry(s, { depth: h, bevelEnabled: false });
+  g.rotateX(Math.PI / 2); // shape XY -> XZ, extrude becomes height
+  g.translate(0, h, 0);
+  return g;
+}
+
+function makeCurvedSail(w, h, mat) {
+  const geo = new THREE.PlaneGeometry(w, h, 8, 4);
+  const pos = geo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const y = pos.getY(i);
+    pos.setZ(i, Math.cos((y / h) * Math.PI * 0.5) * 0.9);
+  }
+  geo.computeVertexNormals();
+  const sail = new THREE.Mesh(geo, mat);
+  sail.rotation.y = Math.PI / 2;
+  sail.castShadow = true;
+  return sail;
+}
+
+const cannonGeo = new THREE.CylinderGeometry(0.16, 0.2, 1.4);
+cannonGeo.rotateX(Math.PI / 2);
+
+// 排船 — a tiny log raft with a single square sail
+function buildRaft({ enemy = false, remote = false, scale = 1 } = {}) {
+  const g = new THREE.Group();
+
+  // logs
+  const logGeo = new THREE.CylinderGeometry(0.32, 0.32, 6, 8);
+  logGeo.rotateZ(Math.PI / 2);
+  for (let i = 0; i < 5; i++) {
+    const log = new THREE.Mesh(logGeo, MAT.trunk);
+    log.position.set(0, 0.35, -1.3 + i * 0.65);
+    log.castShadow = true;
+    g.add(log);
+  }
+  // cross beams
+  for (const bx of [-2, 2]) {
+    const beam = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.25, 3.2), MAT.mast);
+    beam.position.set(bx, 0.68, 0);
+    g.add(beam);
+  }
+  // mast + square sail
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.13, 5.2), MAT.mast);
+  mast.position.set(0.3, 3.1, 0);
+  mast.castShadow = true;
+  g.add(mast);
+  const sailMat = enemy ? MAT.sailEnemy : (remote ? MAT.sailRemote : MAT.sail);
+  const sail = makeCurvedSail(2.8, 2.6, sailMat);
+  sail.position.set(0.15, 3.6, 0);
+  g.add(sail);
+  const yard = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 3.2), MAT.mast);
+  yard.rotation.x = Math.PI / 2;
+  yard.position.set(0.15, 4.9, 0);
+  g.add(yard);
+  // single mounted cannon
+  const cannon = new THREE.Mesh(cannonGeo, MAT.cannon);
+  cannon.rotation.y = Math.PI / 2;
+  cannon.position.set(1.8, 0.95, 0);
+  g.add(cannon);
+  // tiller stick at the back
+  const tiller = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 1.6), MAT.mast);
+  tiller.rotation.z = Math.PI / 2.6;
+  tiller.position.set(-2.8, 1.1, 0);
+  g.add(tiller);
+
+  g.scale.setScalar(scale);
+  g.userData.sails = [sail];
+  g.userData.cannonXs = [0];
+  g.userData.fireY = 1.0;
+  return g;
+}
+
+// generic sailing ship built from a hull config
+function buildSailShip(cfg, { enemy = false, remote = false, cannons = 3, scale = 1 } = {}) {
+  const ship = new THREE.Group();
+  const { len, beam, h } = cfg;
+
+  const hullMat = new THREE.MeshStandardMaterial({ color: cfg.color, roughness: 0.85 });
+  const hull = new THREE.Mesh(makeHullGeo(len, beam, h), hullMat);
   hull.castShadow = true;
   ship.add(hull);
 
-  // Deck
-  const deck = new THREE.Mesh(new THREE.BoxGeometry(8.6, 0.15, 2.9), MAT.deck);
-  deck.position.set(-0.2, 2.25, 0);
+  // deck
+  const deck = new THREE.Mesh(new THREE.BoxGeometry(len * 0.86, 0.15, beam * 0.9), MAT.deck);
+  deck.position.set(-len * 0.02, h + 0.05, 0);
   ship.add(deck);
 
-  // Stern castle
-  const stern = new THREE.Mesh(new THREE.BoxGeometry(2.2, 1.4, 2.8), MAT.hullDark);
-  stern.position.set(-3.4, 3.0, 0);
-  stern.castShadow = true;
-  ship.add(stern);
+  // stern castle
+  if (cfg.stern) {
+    const st = new THREE.Mesh(new THREE.BoxGeometry(cfg.stern.w, cfg.stern.h, cfg.stern.d), MAT.hullDark);
+    st.position.set(-len / 2 + cfg.stern.w / 2 + 0.4, h + cfg.stern.h / 2, 0);
+    st.castShadow = true;
+    ship.add(st);
+  }
+  // forecastle
+  if (cfg.fore) {
+    const fc = new THREE.Mesh(new THREE.BoxGeometry(cfg.fore.w, cfg.fore.h, cfg.fore.d), hullMat);
+    fc.position.set(len / 2 - cfg.fore.w / 2 - 0.9, h + cfg.fore.h / 2, 0);
+    fc.castShadow = true;
+    ship.add(fc);
+  }
 
-  // Bowsprit
-  const bowsprit = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.12, 3.2), MAT.mast);
+  // bowsprit
+  const bowsprit = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.12, len * 0.3), MAT.mast);
   bowsprit.rotation.z = -Math.PI / 2 + 0.35;
-  bowsprit.position.set(6.0, 2.9, 0);
+  bowsprit.position.set(len / 2 + len * 0.12, h + 0.7, 0);
   ship.add(bowsprit);
 
-  // Masts + sails
+  // masts + sails
   const sailMat = enemy ? MAT.sailEnemy : (remote ? MAT.sailRemote : MAT.sail);
   const sails = [];
-  const mastDefs = [
-    { x: 1.6, h: 8.5, sailW: 4.6, sailH: 4.2 },
-    { x: -2.2, h: 7.0, sailW: 3.8, sailH: 3.4 },
-  ];
-  for (const md of mastDefs) {
+  let mainMast = cfg.masts[0];
+  for (const md of cfg.masts) {
+    if (md.h > mainMast.h) mainMast = md;
     const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.18, md.h), MAT.mast);
-    mast.position.set(md.x, 2.2 + md.h / 2, 0);
+    mast.position.set(md.x, h + md.h / 2, 0);
     mast.castShadow = true;
     ship.add(mast);
 
-    // curved sail
-    const sailGeo = new THREE.PlaneGeometry(md.sailW, md.sailH, 8, 4);
-    const pos = sailGeo.attributes.position;
-    for (let i = 0; i < pos.count; i++) {
-      const y = pos.getY(i);
-      const bulge = Math.cos((y / md.sailH) * Math.PI * 0.5) * 0.9;
-      pos.setZ(i, bulge);
-    }
-    sailGeo.computeVertexNormals();
-    const sail = new THREE.Mesh(sailGeo, sailMat);
-    sail.rotation.y = Math.PI / 2;
-    sail.position.set(md.x - 0.15, 2.2 + md.h * 0.55, 0);
-    sail.castShadow = true;
+    const sail = makeCurvedSail(md.sailW, md.sailH, sailMat);
+    sail.position.set(md.x - 0.15, h + md.h * 0.55, 0);
     ship.add(sail);
     sails.push(sail);
 
-    // yard
     const yard = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, md.sailW + 0.6), MAT.mast);
     yard.rotation.x = Math.PI / 2;
-    yard.position.set(md.x - 0.15, 2.2 + md.h * 0.55 + md.sailH / 2, 0);
+    yard.position.set(md.x - 0.15, h + md.h * 0.55 + md.sailH / 2, 0);
     ship.add(yard);
   }
 
-  // Flag
+  // flag on the tallest mast
   const flag = new THREE.Mesh(new THREE.PlaneGeometry(1.4, 0.8), MAT.flag);
-  flag.position.set(1.6, 2.2 + 8.5 + 0.4, 0.7);
+  flag.position.set(mainMast.x, h + mainMast.h + 0.4, 0.7);
   ship.add(flag);
 
-  // Cannons on both broadsides
-  const cannonGeo = new THREE.CylinderGeometry(0.16, 0.2, 1.4);
-  cannonGeo.rotateX(Math.PI / 2);
-  const cannonXs = cannons === 1 ? [-0.4]
-    : Array.from({ length: cannons }, (_, i) => -2.4 + (i * 4.0) / (cannons - 1));
+  // cannons on both broadsides (deck row)
+  const cannonXs = cannons === 1 ? [0]
+    : Array.from({ length: cannons }, (_, i) => -len * 0.22 + (i * len * 0.47) / (cannons - 1));
   for (const side of [-1, 1]) {
     for (const cx of cannonXs) {
       const c = new THREE.Mesh(cannonGeo, MAT.cannon);
-      c.position.set(cx, 2.1, side * 1.55);
+      c.position.set(cx, h - 0.1, side * (beam / 2 - 0.05));
       ship.add(c);
+    }
+  }
+  // second gun deck (visual only) for ships of the line
+  if (cfg.gunDecks > 1) {
+    for (const side of [-1, 1]) {
+      for (const cx of cannonXs) {
+        const c = new THREE.Mesh(cannonGeo, MAT.cannon);
+        c.position.set(cx + len * 0.05, h * 0.45, side * (beam / 2 + 0.25));
+        ship.add(c);
+      }
     }
   }
 
   ship.scale.setScalar(scale);
   ship.userData.sails = sails;
   ship.userData.cannonXs = cannonXs;
+  ship.userData.fireY = h - 0.1;
   return ship;
+}
+
+function buildShip({ type = 'brig', enemy = false, remote = false, cannons = 3, scale = 1 } = {}) {
+  if (type === 'raft') return buildRaft({ enemy, remote, scale });
+  return buildSailShip(HULL_CONFIGS[type] || HULL_CONFIGS.brig, { enemy, remote, cannons, scale });
 }
 
 // ---------- Ship entity ----------
 class Ship {
-  constructor({ enemy = false, remote = false, x = 0, z = 0, heading = 0, cannons = 3, scale = 1,
-                speedMult = 1, cannonDamage = 20, maxHp = 100 } = {}) {
+  constructor({ enemy = false, remote = false, type = 'brig', x = 0, z = 0, heading = 0,
+                cannons = 3, scale = 1, speedMult = 1, turnMult = 1, cannonDamage = 20, maxHp = 100 } = {}) {
     this.enemy = enemy;
     this.remote = remote;
+    this.type = type;
     this.shipScale = scale;
     this.speedMult = speedMult;
+    this.turnMult = turnMult;
     this.cannonDamage = cannonDamage;
-    this.mesh = buildShip({ enemy, remote, cannons, scale });
+    this.mesh = buildShip({ type, enemy, remote, cannons, scale });
     this.mesh.position.set(x, 0, z);
     this.heading = heading;
     this.speed = 0;
@@ -348,10 +457,11 @@ class Ship {
 
   get pos() { return this.mesh.position; }
 
-  rebuild({ cannons, scale }) {
+  rebuild({ cannons, scale, type = this.type }) {
     const pos = this.pos.clone();
     scene.remove(this.mesh);
-    this.mesh = buildShip({ enemy: this.enemy, remote: this.remote, cannons, scale });
+    this.type = type;
+    this.mesh = buildShip({ type, enemy: this.enemy, remote: this.remote, cannons, scale });
     this.mesh.position.copy(pos);
     this.shipScale = scale;
     scene.add(this.mesh);
@@ -375,7 +485,7 @@ class Ship {
     // sailing physics
     const targetSpeed = this.sailLevel * 4.2 * this.speedMult;
     this.speed += (targetSpeed - this.speed) * Math.min(1, dt * 0.5);
-    const turnRate = 0.45 * Math.min(1, this.speed / 4 + 0.25);
+    const turnRate = 0.45 * this.turnMult * Math.min(1, this.speed / 4 + 0.25);
     this.heading += this.turnInput * turnRate * dt;
 
     const dirX = Math.cos(this.heading);
@@ -427,6 +537,7 @@ class Ship {
     this.lastFired.length = 0;
     const dirX = Math.cos(this.heading);
     const dirZ = -Math.sin(this.heading);
+    const fireY = this.mesh.userData.fireY || 2.2;
     // fire from both sides
     for (const side of [-1, 1]) {
       for (const cx of this.mesh.userData.cannonXs) {
@@ -437,7 +548,7 @@ class Ship {
         vel.x += dirX * this.speed;
         vel.z += dirZ * this.speed;
         const cb = new Cannonball(
-          this.pos.x + ox, this.pos.y + 2.2, this.pos.z + oz, vel, this
+          this.pos.x + ox, this.pos.y + fireY, this.pos.z + oz, vel, this
         );
         cannonballs.push(cb);
         this.lastFired.push(cb);
@@ -523,12 +634,13 @@ function spawnHitEffect(x, y, z) {
 
 function spawnMuzzleFlash(ship) {
   const dirX = Math.cos(ship.heading), dirZ = -Math.sin(ship.heading);
+  const fireY = ship.mesh.userData.fireY || 2.2;
   for (const side of [-1, 1]) {
     for (const cx of ship.mesh.userData.cannonXs) {
       const m = new THREE.Mesh(splashGeo, new THREE.MeshBasicMaterial({ color: 0xffcc66, transparent: true }));
       m.position.set(
         ship.pos.x + (cx * dirX + side * 2.4 * dirZ) * ship.shipScale,
-        ship.pos.y + 2.2,
+        ship.pos.y + fireY,
         ship.pos.z + (-cx * dirZ + side * 2.4 * dirX) * ship.shipScale
       );
       particles.push({
@@ -762,8 +874,8 @@ const extraction = (() => {
 
 // ---------- Entities ----------
 const player = new Ship({
-  x: 0, z: 0, heading: Math.PI / 2,
-  cannons: 2, scale: 0.85, speedMult: 1.15, cannonDamage: 20, maxHp: 80,
+  type: 'sloop', x: 0, z: 0, heading: Math.PI / 2,
+  cannons: 2, scale: 0.85, speedMult: 1.15, turnMult: 1.2, cannonDamage: 20, maxHp: 80,
 });
 const enemies = [];
 const cannonballs = [];
@@ -772,7 +884,7 @@ function spawnEnemy() {
   const a = Math.random() * Math.PI * 2;
   const d = 300 + Math.random() * 500;
   const e = new Ship({
-    enemy: true,
+    enemy: true, type: 'brig',
     x: player.pos.x + Math.cos(a) * d,
     z: player.pos.z + Math.sin(a) * d,
     heading: Math.random() * Math.PI * 2,
@@ -782,12 +894,61 @@ function spawnEnemy() {
   enemies.push(e);
 }
 
+// ---------- Floating loot (dropped by sunk ships, picked up into the hold) ----------
+const floatingLoot = []; // {mesh, value, phase}
+const lootBodyGeo = new THREE.BoxGeometry(1.2, 0.7, 0.8);
+
+function spawnFloatingLoot(x, z, value) {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(lootBodyGeo, MAT.hullDark);
+  const lid = new THREE.Mesh(chestLidGeo, MAT.gold);
+  lid.scale.set(0.85, 1, 0.9);
+  lid.position.y = 0.5;
+  g.add(body, lid);
+  g.position.set(x, 0, z);
+  scene.add(g);
+  floatingLoot.push({ mesh: g, value, phase: Math.random() * Math.PI * 2 });
+}
+
+function updateFloatingLoot(dt, t) {
+  for (let i = floatingLoot.length - 1; i >= 0; i--) {
+    const l = floatingLoot[i];
+    l.mesh.position.y = waveHeight(l.mesh.position.x, l.mesh.position.z, t) + 0.35;
+    l.mesh.rotation.y += dt * 0.6;
+    l.mesh.rotation.z = Math.sin(t * 1.5 + l.phase) * 0.15;
+    if (!running) continue;
+    const d = Math.hypot(player.pos.x - l.mesh.position.x, player.pos.z - l.mesh.position.z);
+    if (d < 8 && player.sinking <= 0) {
+      const cap = SHIP_CLASSES[currentClass].cargo;
+      if (cargo.length >= cap) {
+        if (msgTimer <= 0) showMessage('🎒 船舱已满！回港口出售战利品', 1.5);
+        continue;
+      }
+      cargo.push({ icon: '⚱️', name: '打捞的战利品', value: l.value });
+      showMessage(`⚱️ 打捞战利品（价值 ${l.value}）— 船舱 ${cargo.length}/${cap}`);
+      scene.remove(l.mesh);
+      floatingLoot.splice(i, 1);
+    }
+  }
+}
+
 // ---------- Input ----------
 const keys = {};
+let cheatBuffer = '';
 addEventListener('keydown', e => {
   keys[e.code] = true;
   if (e.code === 'Space') e.preventDefault();
   if (e.code === 'Escape' && shopOpen) closeShop();
+
+  // cheat codes: type the phrase anywhere (ignored while typing in the name input)
+  if (document.activeElement !== hud.nameInput && e.key && e.key.length === 1) {
+    cheatBuffer = (cheatBuffer + e.key.toLowerCase()).slice(-32);
+    if (cheatBuffer.endsWith('show me the money')) {
+      cheatBuffer = '';
+      gold = 999999;
+      showMessage('💰 秘籍生效：SHOW ME THE MONEY — 999999 金币！', 3.5);
+    }
+  }
 });
 addEventListener('keyup', e => { keys[e.code] = false; });
 
@@ -839,12 +1000,13 @@ function updateTrajectory(t) {
   const power = chargePower();
   const cxs = player.mesh.userData.cannonXs;
   const cx = cxs[Math.floor(cxs.length / 2)];
+  const fireY = player.mesh.userData.fireY || 2.2;
   for (let s = 0; s < 2; s++) {
     const side = s === 0 ? -1 : 1;
     const line = trajLines[s];
     const posAttr = line.geometry.attributes.position;
     let px = player.pos.x + (cx * dirX + side * 1.8 * dirZ) * player.shipScale;
-    let py = player.pos.y + 2.2;
+    let py = player.pos.y + fireY;
     let pz = player.pos.z + (-cx * dirZ + side * 1.8 * dirX) * player.shipScale;
     const vel = new THREE.Vector3(side * dirZ, 0.28, -side * dirX).normalize()
       .multiplyScalar(CANNON_SPEED * power);
@@ -873,6 +1035,7 @@ const hud = {
   gold: document.getElementById('gold'),
   sunk: document.getElementById('sunk'),
   shipName: document.getElementById('ship-name'),
+  cargo: document.getElementById('cargo'),
   hullBar: document.querySelector('#hull-bar > div'),
   speed: document.getElementById('speed'),
   sailPips: [...document.querySelectorAll('.sail-pip')],
@@ -902,6 +1065,7 @@ const COMPASS = ['N', '·', 'NE', '·', 'E', '·', 'SE', '·', 'S', '·', 'SW', 
 }
 
 let gold = 0, sunkCount = 0;
+let cargo = []; // {icon, name, value} — loot in the hold, sold at the port
 let msgTimer = 0;
 function showMessage(text, dur = 2.5) {
   hud.message.textContent = text;
@@ -915,11 +1079,13 @@ function escapeHtml(s) {
   }[c]));
 }
 
-// ---------- Shop / upgrades ----------
+// ---------- Ship classes & upgrades ----------
 const SHIP_CLASSES = [
-  { name: '单桅快船', en: 'Sloop', cost: 0, hp: 80, cannons: 2, scale: 0.85, speed: 1.15 },
-  { name: '双桅护卫舰', en: 'Brigantine', cost: 400, hp: 130, cannons: 3, scale: 1.0, speed: 1.0 },
-  { name: '风帆战列舰', en: "Man o' War", cost: 900, hp: 200, cannons: 4, scale: 1.2, speed: 0.88 },
+  { id: 'sloop', name: '单桅快船', en: 'Sloop', cost: 0, hp: 80, cannons: 2, scale: 0.85, speed: 1.15, turn: 1.2, cargo: 4 },
+  { id: 'raft', name: '排船', en: 'Raft', cost: 200, hp: 50, cannons: 1, scale: 0.6, speed: 1.3, turn: 1.6, cargo: 2 },
+  { id: 'brig', name: '双桅护卫舰', en: 'Brigantine', cost: 400, hp: 130, cannons: 3, scale: 1.0, speed: 1.0, turn: 1.0, cargo: 6 },
+  { id: 'galleon', name: '重型盖伦船', en: 'Galleon', cost: 700, hp: 170, cannons: 4, scale: 1.15, speed: 0.92, turn: 0.85, cargo: 8 },
+  { id: 'manowar', name: '风帆战列舰', en: "Man o' War", cost: 1200, hp: 220, cannons: 5, scale: 1.3, speed: 0.85, turn: 0.7, cargo: 10 },
 ];
 const UPGRADES = [
   { id: 'hull', name: '船体强化', desc: '每级 +40 最大耐久', costs: [150, 300, 500], level: 0 },
@@ -936,6 +1102,7 @@ function refreshPlayerStats(heal = false) {
   player.maxHp = cls.hp + UPGRADES[0].level * 40;
   player.cannonDamage = 20 + UPGRADES[1].level * 10;
   player.speedMult = cls.speed * (1 + UPGRADES[2].level * 0.1);
+  player.turnMult = cls.turn;
   player.hp = heal ? player.maxHp : Math.min(player.hp, player.maxHp);
   hud.shipName.textContent = cls.en;
 }
@@ -955,6 +1122,30 @@ function renderShop() {
 
   const upEl = document.getElementById('shop-upgrades');
   upEl.innerHTML = '';
+
+  // sell loot row
+  {
+    const total = cargo.reduce((s, c) => s + c.value, 0);
+    const row = document.createElement('div');
+    row.className = 'shop-row';
+    row.innerHTML = `
+      <div class="shop-info">
+        <b>出售战利品</b>
+        <small>船舱 ${cargo.length} 件 ${cargo.map(c => c.icon).join(' ') || '（空）'}</small>
+      </div>`;
+    const btn = document.createElement('button');
+    btn.textContent = total <= 0 ? '无战利品' : `出售 💰${total}`;
+    btn.disabled = total <= 0;
+    btn.addEventListener('click', () => {
+      if (total <= 0) return;
+      gold += total;
+      cargo = [];
+      showMessage(`💰 售出战利品，获得 ${total} 金币！`);
+      renderShop();
+    });
+    row.appendChild(btn);
+    upEl.appendChild(row);
+  }
 
   // repair row
   {
@@ -1016,7 +1207,7 @@ function renderShop() {
     row.innerHTML = `
       <div class="shop-info">
         <b>${cls.name}</b> <small>${cls.en}</small>
-        <small>耐久 ${cls.hp} · 火炮 ${cls.cannons * 2} 门 · 航速 ×${cls.speed}</small>
+        <small>耐久 ${cls.hp} · 火炮 ${cls.cannons * 2} 门 · 航速 ×${cls.speed} · 转向 ×${cls.turn} · 船舱 ${cls.cargo}</small>
       </div>`;
     const btn = document.createElement('button');
     btn.textContent = owned ? '当前船只' : `建造 💰${cls.cost}`;
@@ -1025,7 +1216,7 @@ function renderShop() {
       if (gold < cls.cost) return;
       gold -= cls.cost;
       currentClass = i;
-      player.rebuild({ cannons: cls.cannons, scale: cls.scale });
+      player.rebuild({ cannons: cls.cannons, scale: cls.scale, type: cls.id });
       refreshPlayerStats(true);
       showMessage(`🚢 新船下水：${cls.name}！`);
       renderShop();
@@ -1094,6 +1285,13 @@ function drawMinimap(t) {
     mmCtx.lineTo(x, y + p); mmCtx.lineTo(x - p, y);
     mmCtx.closePath();
     mmCtx.fill();
+  }
+
+  // floating loot
+  mmCtx.fillStyle = '#ffc93c';
+  for (const l of floatingLoot) {
+    const [x, y] = toMap(l.mesh.position.x, l.mesh.position.z);
+    mmCtx.fillRect(x - 1.5, y - 1.5, 3, 3);
   }
 
   // AI enemies (solo)
@@ -1188,8 +1386,9 @@ function makeNameTag(text) {
 }
 
 function createRemote(p) {
+  const cls = SHIP_CLASSES[p.cls] || SHIP_CLASSES[0];
   const ship = new Ship({
-    remote: true, x: p.x, z: p.z, heading: p.heading,
+    remote: true, type: cls.id, x: p.x, z: p.z, heading: p.heading,
     cannons: p.cannons, scale: p.scale, maxHp: p.maxHp,
   });
   ship.sailLevel = p.sailLevel;
@@ -1248,7 +1447,8 @@ function handleNet(msg) {
         r.gold = p.gold; r.sunk = p.sunk; r.name = p.name;
         if (r.cls !== p.cls) {
           r.cls = p.cls; r.cannons = p.cannons; r.scale = p.scale;
-          r.ship.rebuild({ cannons: p.cannons, scale: p.scale });
+          const cls = SHIP_CLASSES[p.cls] || SHIP_CLASSES[0];
+          r.ship.rebuild({ cannons: p.cannons, scale: p.scale, type: cls.id });
           r.tag.position.set(0, 12 / p.scale, 0);
           r.ship.mesh.add(r.tag);
         }
@@ -1297,6 +1497,8 @@ function handleNet(msg) {
     }
 
     case 'sink': {
+      // the victim drops a loot chest anyone can salvage
+      if (typeof msg.x === 'number') spawnFloatingLoot(msg.x, msg.z, 100);
       if (msg.id === net.id) {
         player.sinking = 0.001;
         hideTrajectory();
@@ -1308,8 +1510,7 @@ function handleNet(msg) {
         if (r) r.ship.sinking = 0.001;
         if (msg.by === net.id) {
           sunkCount++;
-          gold += 100;
-          showMessage(`💀 击沉 ${r ? r.name : '敌船'}！+100 金币`);
+          showMessage(`💀 击沉 ${r ? r.name : '敌船'}！战利品落水，驶过去打捞`);
         } else if (r) {
           showMessage(`💀 ${r.name} 的船沉没了`, 2);
         }
@@ -1333,8 +1534,9 @@ function handleNet(msg) {
         if (r) {
           if (r.ship.dead) {
             scene.remove(r.ship.mesh);
+            const cls = SHIP_CLASSES[r.cls] || SHIP_CLASSES[0];
             r.ship = new Ship({
-              remote: true, x: msg.x, z: msg.z,
+              remote: true, type: cls.id, x: msg.x, z: msg.z,
               cannons: r.cannons, scale: r.scale, maxHp: msg.hp,
             });
             r.ship.mesh.add(r.tag);
@@ -1467,11 +1669,16 @@ function nearestTreasure() {
 function tryDig() {
   const found = nearestTreasure();
   if (!found) return;
+  const cap = SHIP_CLASSES[currentClass].cargo;
+  if (cargo.length >= cap) {
+    showMessage('🎒 船舱已满！回港口出售战利品', 2.5);
+    return;
+  }
   found.tr.dug = true;
   found.tr.chest.visible = true;
   const haul = 80 + Math.floor(Math.random() * 120);
-  gold += haul;
-  showMessage(`💰 挖出 ${haul} 金币！`);
+  cargo.push({ icon: '💰', name: '宝藏箱', value: haul });
+  showMessage(`💰 宝藏装入船舱（${cargo.length}/${cap}）— 回港出售换取金币`);
   setTimeout(() => {
     scene.remove(found.tr.group);
     spawnTreasure(found.isl);
@@ -1487,8 +1694,8 @@ function damageShipSolo(tgt, dmg, byPlayer, silent = false) {
     if (wasAlive && player.hp <= 0) setTimeout(() => endGame(false), 2500);
   } else if (wasAlive && tgt.hp <= 0 && byPlayer) {
     sunkCount++;
-    gold += 50;
-    showMessage('💀 击沉敌船！+50 金币');
+    spawnFloatingLoot(tgt.pos.x, tgt.pos.z, 50);
+    showMessage('💀 击沉敌船！战利品落水，驶过去打捞');
   }
 }
 
@@ -1620,7 +1827,7 @@ function tick() {
 
     // --- context prompts ---
     if (msgTimer <= 0) {
-      if (nearPort()) showMessage('🏘️ 港口 — 按 F 靠港交易（修理 / 升级 / 造新船）', 0.5);
+      if (nearPort()) showMessage('🏘️ 港口 — 按 F 靠港交易（出售 / 修理 / 升级 / 造新船）', 0.5);
       else if (nearExtraction()) showMessage('🛶 撤离点 — 按 F 带着战利品撤离！', 0.5);
       else if (nearestTreasure()) showMessage('X marks the spot — 按 F 挖掘宝藏！', 0.5);
     }
@@ -1628,6 +1835,7 @@ function tick() {
     // --- HUD ---
     hud.gold.textContent = gold;
     hud.sunk.textContent = sunkCount;
+    hud.cargo.textContent = `${cargo.length}/${SHIP_CLASSES[currentClass].cargo}`;
     hud.hullBar.style.width = `${(player.hp / player.maxHp) * 100}%`;
     hud.speed.textContent = `${(player.speed * 1.8).toFixed(0)} kn`;
     hud.sailPips.forEach((p, i) => p.classList.toggle('on', i < player.sailLevel));
@@ -1645,6 +1853,7 @@ function tick() {
   }
 
   updateParticles(dt);
+  updateFloatingLoot(dt, t);
   drawMinimap(t);
 
   // --- camera follows player ---

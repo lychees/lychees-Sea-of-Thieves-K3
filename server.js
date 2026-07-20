@@ -85,7 +85,7 @@ function damagePlayer(p, dmg, by, x, y, z) {
   broadcast({ t: 'hit', target: p.id, hp: p.hp, by, x, y, z });
   if (p.hp <= 0) {
     p.dead = true;
-    broadcast({ t: 'sink', id: p.id, by });
+    broadcast({ t: 'sink', id: p.id, by, x: p.x, z: p.z });
     setTimeout(() => {
       if (!players.has(p.id)) return;
       const a = Math.random() * Math.PI * 2;
