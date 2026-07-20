@@ -1,0 +1,5 @@
+# session exports / local clutter
+kimi-export-session_*.md
+.DS_Store
+Thumbs.db
+node_modules/
