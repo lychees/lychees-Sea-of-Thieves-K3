@@ -385,7 +385,7 @@ class Ship {
     this.cooldown = Math.max(0, this.cooldown - dt);
   }
 
-  fireBroadside(cannonballs) {
+  fireBroadside(cannonballs, power = 1) {
     if (this.cooldown > 0 || this.sinking > 0 || this.dead) return false;
     this.cooldown = CANNON_COOLDOWN;
     const dirX = Math.cos(this.heading);
@@ -396,7 +396,7 @@ class Ship {
         const ox = (cx * dirX + side * 1.8 * dirZ) * this.shipScale;
         const oz = (-cx * dirZ + side * 1.8 * dirX) * this.shipScale;
         const vel = new THREE.Vector3(side * dirZ, 0.28, -side * dirX).normalize()
-          .multiplyScalar(CANNON_SPEED * (0.92 + Math.random() * 0.16));
+          .multiplyScalar(CANNON_SPEED * power * (0.92 + Math.random() * 0.16));
         vel.x += dirX * this.speed;
         vel.z += dirZ * this.speed;
         cannonballs.push(new Cannonball(
@@ -749,6 +749,68 @@ addEventListener('mousemove', e => {
 addEventListener('wheel', e => {
   camDist = THREE.MathUtils.clamp(camDist + e.deltaY * 0.02, 12, 60);
 });
+
+// ---------- Charged shots & trajectory preview ----------
+const CHARGE_TIME = 1.2;   // seconds to full charge
+const TRAJ_POINTS = 64;
+let charging = false;
+let charge = 0;
+
+const chargeEl = document.getElementById('charge');
+const chargeFill = document.getElementById('charge-fill');
+
+// one trajectory line per broadside
+const trajLines = [];
+for (let i = 0; i < 2; i++) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(TRAJ_POINTS * 3), 3));
+  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
+    color: 0xffd76a, transparent: true, opacity: 0.85,
+  }));
+  line.visible = false;
+  line.frustumCulled = false;
+  scene.add(line);
+  trajLines.push(line);
+}
+
+function chargePower() {
+  return 0.6 + 0.9 * charge; // velocity multiplier 0.6x..1.5x (range up to ~2.2x)
+}
+
+function updateTrajectory(t) {
+  const dirX = Math.cos(player.heading);
+  const dirZ = -Math.sin(player.heading);
+  const power = chargePower();
+  const cxs = player.mesh.userData.cannonXs;
+  const cx = cxs[Math.floor(cxs.length / 2)];
+  for (let s = 0; s < 2; s++) {
+    const side = s === 0 ? -1 : 1;
+    const line = trajLines[s];
+    const posAttr = line.geometry.attributes.position;
+    let px = player.pos.x + (cx * dirX + side * 1.8 * dirZ) * player.shipScale;
+    let py = player.pos.y + 2.2;
+    let pz = player.pos.z + (-cx * dirZ + side * 1.8 * dirX) * player.shipScale;
+    const vel = new THREE.Vector3(side * dirZ, 0.28, -side * dirX).normalize()
+      .multiplyScalar(CANNON_SPEED * power);
+    vel.x += dirX * player.speed;
+    vel.z += dirZ * player.speed;
+    const step = 0.09;
+    let n = 0;
+    for (; n < TRAJ_POINTS; n++) {
+      posAttr.setXYZ(n, px, py, pz);
+      vel.y -= GRAVITY * step;
+      px += vel.x * step; py += vel.y * step; pz += vel.z * step;
+      if (py <= waveHeight(px, pz, t)) break;
+    }
+    line.geometry.setDrawRange(0, n + 1);
+    posAttr.needsUpdate = true;
+    line.visible = true;
+  }
+}
+
+function hideTrajectory() {
+  for (const l of trajLines) l.visible = false;
+}
 
 // ---------- HUD ----------
 const hud = {
@@ -1128,7 +1190,24 @@ function tick() {
       if (keys['KeyS'] && player.sailLevel > 0) { player.sailLevel--; sailKeyRepeat = 0.25; }
     }
     player.turnInput = (keys['KeyA'] ? 1 : 0) - (keys['KeyD'] ? 1 : 0);
-    if (keys['Space']) { player.fireBroadside(cannonballs); }
+
+    // charged broadside: hold Space to charge (shows trajectory), release to fire
+    if (keys['Space'] && !charging && player.cooldown <= 0 && player.sinking <= 0) {
+      charging = true;
+      charge = 0;
+    }
+    if (charging) {
+      charge = Math.min(1, charge + dt / CHARGE_TIME);
+      updateTrajectory(t);
+      chargeEl.classList.add('show');
+      chargeFill.style.width = `${charge * 100}%`;
+      if (!keys['Space']) {
+        charging = false;
+        hideTrajectory();
+        chargeEl.classList.remove('show');
+        player.fireBroadside(cannonballs, chargePower());
+      }
+    }
     if (keys['KeyF']) {
       keys['KeyF'] = false;
       if (nearPort()) openShop();

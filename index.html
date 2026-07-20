@@ -66,6 +66,19 @@
     .sail-pip { width: 34px; height: 12px; border-radius: 3px; background: rgba(255,255,255,.12); }
     .sail-pip.on { background: linear-gradient(90deg, #e8d9a0, #c9b268); box-shadow: 0 0 8px rgba(232,217,160,.6); }
 
+    /* Cannon charge bar */
+    #charge {
+      position: absolute; bottom: 64px; left: 50%; transform: translateX(-50%);
+      width: 220px; height: 12px; border-radius: 6px; overflow: hidden;
+      background: rgba(10,20,35,.6); border: 1px solid rgba(243,233,200,.35);
+      opacity: 0; transition: opacity .15s;
+    }
+    #charge.show { opacity: 1; }
+    #charge-fill {
+      height: 100%; width: 0;
+      background: linear-gradient(90deg, #ffd76a, #ff5a4e);
+    }
+
     /* Message */
     #message {
       position: absolute; bottom: 90px; left: 50%; transform: translateX(-50%);
@@ -169,11 +182,14 @@
       <span id="speed" style="margin-left:10px">0 kn</span>
     </div>
 
+    <div id="charge"><div id="charge-fill"></div></div>
+
     <div id="message"></div>
 
     <div id="help">
       <b>W/S</b> 升降帆 &nbsp; <b>A/D</b> 转向<br/>
-      <b>Space</b> 舷炮齐射 &nbsp; <b>F</b> 互动（挖宝/靠港/撤离）<br/>
+      <b>Space</b> 长按蓄力（显示弹道），松开发射<br/>
+      <b>F</b> 互动（挖宝/靠港/撤离）<br/>
       <b>鼠标拖拽</b> 旋转视角 &nbsp; <b>滚轮</b> 缩放<br/>
       🏘️ 回港口升级装备、造新船 · 🛶 到撤离点带走战利品
     </div>
@@ -196,7 +212,7 @@
       <div class="keys">
         <b>W / S</b> — 升起 / 降下船帆<br/>
         <b>A / D</b> — 转向<br/>
-        <b>Space</b> — 舷炮齐射<br/>
+        <b>Space</b> — 长按蓄力（显示弹道），松开舷炮齐射<br/>
         <b>F</b> — 互动：挖宝藏 · 靠港交易 · 撤离<br/>
         <b>鼠标拖拽 / 滚轮</b> — 旋转 &amp; 缩放视角<br/>
         🏘️ 港口可修理、升级船体/火炮/船帆，还能建造更大的新船<br/>
