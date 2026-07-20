@@ -56,6 +56,19 @@
       box-shadow: 0 4px 16px rgba(0,0,0,.5);
     }
 
+    /* Leaderboard */
+    #leaderboard {
+      position: absolute; top: 220px; right: 18px; width: 190px;
+      background: rgba(10,20,35,.55); border: 1px solid rgba(243,233,200,.25);
+      border-radius: 10px; padding: 10px 14px; font-size: 14px;
+    }
+    #leaderboard.hidden { display: none; }
+    #leaderboard h3 { color: #ffd76a; font-size: 15px; margin-bottom: 6px; }
+    #lb-list { list-style: none; }
+    #lb-list li { padding: 2px 0; color: #cfe3f5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #lb-list li.me { color: #ffd76a; font-weight: bold; }
+    #lb-count { margin-top: 6px; font-size: 12px; color: #8fa5bb; }
+
     /* Sails */
     #sails {
       position: absolute; bottom: 22px; left: 50%; transform: translateX(-50%);
@@ -143,8 +156,16 @@
       text-shadow: 0 4px 18px rgba(0,0,0,.9), 0 0 40px rgba(255,180,60,.25);
     }
     #overlay h2 { font-size: 20px; font-weight: normal; margin: 14px 0 26px; color: #cfe3f5; }
-    #overlay .keys { font-size: 15px; line-height: 2; color: #b9c8d8; margin-bottom: 30px; }
+    #overlay .keys { font-size: 15px; line-height: 2; color: #b9c8d8; margin-bottom: 26px; }
     #overlay .keys b { color: #ffd76a; }
+    #name-input {
+      pointer-events: auto; font-size: 17px; font-family: inherit; text-align: center;
+      padding: 10px 16px; margin-bottom: 16px; width: 280px;
+      color: #f3e9c8; background: rgba(255,255,255,.08);
+      border: 1px solid rgba(243,233,200,.4); border-radius: 8px; outline: none;
+    }
+    #name-input::placeholder { color: #7d8fa0; }
+    #mode-buttons { display: flex; gap: 16px; }
     #overlay button {
       pointer-events: auto; cursor: pointer;
       font-size: 20px; font-family: inherit; letter-spacing: 2px;
@@ -153,6 +174,8 @@
       box-shadow: 0 4px 16px rgba(0,0,0,.6);
     }
     #overlay button:hover { filter: brightness(1.1); }
+    #mp-btn { background: linear-gradient(180deg, #7fd7ff, #2e86c9); color: #06121f; }
+    #start-btn { display: none; }
     #overlay #overlay-sub { margin-top: 18px; font-size: 15px; color: #8fa5bb; }
   </style>
 </head>
@@ -173,6 +196,12 @@
     </div>
 
     <canvas id="minimap" width="190" height="190"></canvas>
+
+    <div id="leaderboard" class="hidden">
+      <h3>🏆 排行榜</h3>
+      <ol id="lb-list"></ol>
+      <div id="lb-count"></div>
+    </div>
 
     <div id="sails">
       Sails
@@ -216,9 +245,15 @@
         <b>F</b> — 互动：挖宝藏 · 靠港交易 · 撤离<br/>
         <b>鼠标拖拽 / 滚轮</b> — 旋转 &amp; 缩放视角<br/>
         🏘️ 港口可修理、升级船体/火炮/船帆，还能建造更大的新船<br/>
-        🛶 抵达蓝色光柱撤离点即可带着所有金币胜利离场
+        🛶 抵达蓝色光柱撤离点即可带着所有金币胜利离场<br/>
+        🌐 多人模式：与全服玩家同海竞技，击沉他们 +100 金币！
       </div>
-      <button id="start-btn">Set Sail 启航</button>
+      <input id="name-input" maxlength="12" placeholder="海盗名号（多人模式可选）" />
+      <div id="mode-buttons">
+        <button id="solo-btn">单人航行</button>
+        <button id="mp-btn">🌐 多人联机</button>
+        <button id="start-btn">再次启航</button>
+      </div>
       <div id="overlay-sub"></div>
     </div>
   </div>

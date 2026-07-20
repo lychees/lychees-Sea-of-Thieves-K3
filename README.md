@@ -6,14 +6,24 @@ port, and escape through the extraction point with your loot.
 
 ## Play
 
-Serve the folder with any static file server and open it in a browser:
-
 ```bash
-python -m http.server 8080
-# then open http://localhost:8080
+npm install
+npm start          # serves http://localhost:8080 (static files + WebSocket)
 ```
 
+Open http://localhost:8080 and choose **单人航行** (solo vs AI) or **🌐 多人联机**
+(io-style multiplayer — every connected player shares the same sea, leaderboard included).
+For solo play only, any static file server (e.g. `python -m http.server 8080`) also works.
+
 > An internet connection is required (three.js is loaded from a CDN via import map).
+
+## Multiplayer
+
+- `server.js` is the authoritative server: it relays player state at 10 Hz, simulates
+  all cannonballs at 30 Hz, and resolves hits with an oriented-bounding-box (OBB) test
+  (plus near-miss splash damage). Sinking a player earns +100 gold; sunk ships respawn.
+- The world uses a fixed seed, so every client generates identical islands, port,
+  treasures, and the extraction point.
 
 ## Controls
 

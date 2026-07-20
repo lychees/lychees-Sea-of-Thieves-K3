@@ -1,0 +1,12 @@
+{
+  "name": "sea-of-rouge",
+  "version": "1.0.0",
+  "description": "A Sea of Thieves-inspired three.js pirate game with WebSocket multiplayer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

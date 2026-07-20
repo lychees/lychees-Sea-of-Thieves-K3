@@ -1,11 +1,13 @@
 import * as THREE from 'three';
 
 // ============================================================
-// Sea of Rouge — a Sea of Thieves-inspired three.js toy game
+// Sea of Rouge — a Sea of Thieves-inspired three.js game
+// Solo mode vs AI ships, or io-style WebSocket multiplayer.
 // ============================================================
 
 // ---------- Config ----------
 const WORLD_SIZE = 1600;          // playable radius
+const WORLD_SEED = 20260720;      // fixed seed: all MP clients share the same world
 const ISLAND_COUNT = 7;
 const ENEMY_COUNT = 3;
 const GRAVITY = 22;
@@ -13,8 +15,22 @@ const CANNON_SPEED = 55;
 const CANNON_COOLDOWN = 1.4;
 const ENEMY_MAX_HP = 60;
 const ENEMY_CANNON_DAMAGE = 20;
+const NEAR_MISS_RADIUS = 7;       // splash damage radius for water impacts
+const NEAR_MISS_DAMAGE = 6;
 
-// ---------- Waves (shared between GLSL and JS) ----------
+// ---------- Seeded RNG (world generation must match across clients) ----------
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rng = mulberry32(WORLD_SEED);
+
+// ---------- Waves (shared between GLSL and JS; mirrored in server.js) ----------
 const WAVES = [
   { dir: new THREE.Vector2(1.0, 0.35).normalize(), amp: 0.55, freq: 0.055, speed: 1.15 },
   { dir: new THREE.Vector2(-0.6, 1.0).normalize(), amp: 0.38, freq: 0.092, speed: 1.6 },
@@ -33,6 +49,17 @@ function waveHeight(x, z, t) {
 const WAVE_GLSL = WAVES.map(w => `
   h += ${w.amp.toFixed(3)} * sin((p.x * ${w.dir.x.toFixed(5)} + p.z * ${w.dir.y.toFixed(5)}) * ${w.freq.toFixed(4)} + uTime * ${w.speed.toFixed(3)});
 `).join('');
+
+// ---------- OBB hit test for cannonballs (mirrored in server.js) ----------
+function cannonballHitsShip(p, ship) {
+  const dx = p.x - ship.pos.x, dz = p.z - ship.pos.z;
+  const c = Math.cos(ship.heading), s = Math.sin(ship.heading);
+  const lx = dx * c - dz * s;   // along ship forward
+  const lz = dx * s + dz * c;   // along ship beam
+  const dy = p.y - ship.pos.y;
+  const sc = ship.shipScale;
+  return Math.abs(lx) < 5.4 * sc && Math.abs(lz) < 2.0 * sc && dy > -0.5 && dy < 4.5 * sc;
+}
 
 // ---------- Renderer / Scene ----------
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -184,6 +211,7 @@ const MAT = {
   mast: new THREE.MeshStandardMaterial({ color: 0x4a3018, roughness: 0.85 }),
   sail: new THREE.MeshStandardMaterial({ color: 0xe8ddc0, roughness: 0.95, side: THREE.DoubleSide }),
   sailEnemy: new THREE.MeshStandardMaterial({ color: 0x2b2b30, roughness: 0.95, side: THREE.DoubleSide }),
+  sailRemote: new THREE.MeshStandardMaterial({ color: 0x9fd7ff, roughness: 0.95, side: THREE.DoubleSide }),
   cannon: new THREE.MeshStandardMaterial({ color: 0x22242a, roughness: 0.5, metalness: 0.7 }),
   gold: new THREE.MeshStandardMaterial({ color: 0xffc93c, roughness: 0.3, metalness: 0.8, emissive: 0x664400 }),
   sand: new THREE.MeshStandardMaterial({ color: 0xd9c08a, roughness: 1 }),
@@ -195,7 +223,7 @@ const MAT = {
 };
 
 // ---------- Ship builder ----------
-function buildShip({ enemy = false, cannons = 3, scale = 1 } = {}) {
+function buildShip({ enemy = false, remote = false, cannons = 3, scale = 1 } = {}) {
   const ship = new THREE.Group();
 
   // Hull: tapered box via extruded shape
@@ -232,7 +260,7 @@ function buildShip({ enemy = false, cannons = 3, scale = 1 } = {}) {
   ship.add(bowsprit);
 
   // Masts + sails
-  const sailMat = enemy ? MAT.sailEnemy : MAT.sail;
+  const sailMat = enemy ? MAT.sailEnemy : (remote ? MAT.sailRemote : MAT.sail);
   const sails = [];
   const mastDefs = [
     { x: 1.6, h: 8.5, sailW: 4.6, sailH: 4.2 },
@@ -293,13 +321,14 @@ function buildShip({ enemy = false, cannons = 3, scale = 1 } = {}) {
 
 // ---------- Ship entity ----------
 class Ship {
-  constructor({ enemy = false, x = 0, z = 0, heading = 0, cannons = 3, scale = 1,
+  constructor({ enemy = false, remote = false, x = 0, z = 0, heading = 0, cannons = 3, scale = 1,
                 speedMult = 1, cannonDamage = 20, maxHp = 100 } = {}) {
     this.enemy = enemy;
+    this.remote = remote;
     this.shipScale = scale;
     this.speedMult = speedMult;
     this.cannonDamage = cannonDamage;
-    this.mesh = buildShip({ enemy, cannons, scale });
+    this.mesh = buildShip({ enemy, remote, cannons, scale });
     this.mesh.position.set(x, 0, z);
     this.heading = heading;
     this.speed = 0;
@@ -310,6 +339,7 @@ class Ship {
     this.cooldown = 0;
     this.sinking = 0;            // >0 while sinking
     this.dead = false;
+    this.lastFired = [];         // cannonballs of the most recent volley
     // enemy AI
     this.aiTimer = 0;
     this.aiTurn = 0;
@@ -321,7 +351,7 @@ class Ship {
   rebuild({ cannons, scale }) {
     const pos = this.pos.clone();
     scene.remove(this.mesh);
-    this.mesh = buildShip({ enemy: this.enemy, cannons, scale });
+    this.mesh = buildShip({ enemy: this.enemy, remote: this.remote, cannons, scale });
     this.mesh.position.copy(pos);
     this.shipScale = scale;
     scene.add(this.mesh);
@@ -362,7 +392,15 @@ class Ship {
       this.heading += Math.PI * dt; // turn around
     }
 
-    // wave riding: sample height at bow/stern/port/starboard
+    this.applyWaveRide(t);
+    this.updateSailVisual(dt);
+
+    this.cooldown = Math.max(0, this.cooldown - dt);
+  }
+
+  applyWaveRide(t) {
+    const dirX = Math.cos(this.heading);
+    const dirZ = -Math.sin(this.heading);
     const px = this.pos.x, pz = this.pos.z;
     const bow = waveHeight(px + dirX * 4, pz + dirZ * 4, t);
     const sternH = waveHeight(px - dirX * 4, pz - dirZ * 4, t);
@@ -371,23 +409,22 @@ class Ship {
     this.pos.y = (bow + sternH + port + star) / 4;
     const pitch = Math.atan2(sternH - bow, 8);
     const roll = Math.atan2(port - star, 4);
-
     this.mesh.rotation.set(0, this.heading, 0);
     this.mesh.rotateX(roll * 0.7);
     this.mesh.rotateZ(pitch * 0.7);
+  }
 
-    // sail visual follows sail level
+  updateSailVisual(dt) {
     const sailScale = 0.25 + (this.sailLevel / 3) * 0.75;
     for (const s of this.mesh.userData.sails) {
       s.scale.y += (sailScale - s.scale.y) * Math.min(1, dt * 3);
     }
-
-    this.cooldown = Math.max(0, this.cooldown - dt);
   }
 
   fireBroadside(cannonballs, power = 1) {
     if (this.cooldown > 0 || this.sinking > 0 || this.dead) return false;
     this.cooldown = CANNON_COOLDOWN;
+    this.lastFired.length = 0;
     const dirX = Math.cos(this.heading);
     const dirZ = -Math.sin(this.heading);
     // fire from both sides
@@ -399,9 +436,11 @@ class Ship {
           .multiplyScalar(CANNON_SPEED * power * (0.92 + Math.random() * 0.16));
         vel.x += dirX * this.speed;
         vel.z += dirZ * this.speed;
-        cannonballs.push(new Cannonball(
+        const cb = new Cannonball(
           this.pos.x + ox, this.pos.y + 2.2, this.pos.z + oz, vel, this
-        ));
+        );
+        cannonballs.push(cb);
+        this.lastFired.push(cb);
       }
     }
     spawnMuzzleFlash(this);
@@ -431,6 +470,7 @@ class Cannonball {
     this.life = 6;
     scene.add(this.mesh);
   }
+  // returns true while flying, 'water' on splash, 'expired' on timeout
   update(dt, t) {
     this.life -= dt;
     this.vel.y -= GRAVITY * dt;
@@ -438,13 +478,13 @@ class Cannonball {
     const p = this.mesh.position;
     if (p.y <= waveHeight(p.x, p.z, t)) {
       spawnSplash(p.x, p.z, t);
-      return false;
+      return 'water';
     }
-    return this.life > 0;
+    return this.life > 0 ? true : 'expired';
   }
 }
 
-// ---------- Particles (splashes & flashes) ----------
+// ---------- Particles (splashes, flashes, hits) ----------
 const particles = [];
 const splashGeo = new THREE.SphereGeometry(0.35, 6, 5);
 const splashMat = new THREE.MeshBasicMaterial({ color: 0xdff2f8, transparent: true });
@@ -459,6 +499,23 @@ function spawnSplash(x, z, t) {
       mesh: m, life: 0.7 + Math.random() * 0.3, age: 0,
       vel: new THREE.Vector3(Math.cos(a) * 3, 5 + Math.random() * 4, Math.sin(a) * 3),
       grav: 14, shrink: true,
+    });
+    scene.add(m);
+  }
+}
+
+function spawnHitEffect(x, y, z) {
+  for (let i = 0; i < 12; i++) {
+    const hot = i % 2 === 0;
+    const m = new THREE.Mesh(splashGeo, new THREE.MeshBasicMaterial({
+      color: hot ? 0xff8844 : 0x3a2a1a, transparent: true,
+    }));
+    m.position.set(x, y, z);
+    const a = Math.random() * Math.PI * 2;
+    particles.push({
+      mesh: m, life: 0.5 + Math.random() * 0.35, age: 0,
+      vel: new THREE.Vector3(Math.cos(a) * 6, 3 + Math.random() * 5, Math.sin(a) * 6),
+      grav: 12, shrink: true,
     });
     scene.add(m);
   }
@@ -524,21 +581,21 @@ function buildIsland(x, z, r) {
 
   // a rock or two
   for (let i = 0; i < 2; i++) {
-    const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(r * 0.1 + Math.random() * r * 0.06), MAT.rock);
-    const a = Math.random() * Math.PI * 2;
+    const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(r * 0.1 + rng() * r * 0.06), MAT.rock);
+    const a = rng() * Math.PI * 2;
     rock.position.set(Math.cos(a) * r * 0.5, 1.2, Math.sin(a) * r * 0.5);
     rock.castShadow = true;
     g.add(rock);
   }
 
   // palm trees
-  const palms = 2 + Math.floor(Math.random() * 3);
+  const palms = 2 + Math.floor(rng() * 3);
   for (let i = 0; i < palms; i++) {
     const palm = new THREE.Group();
-    const a = Math.random() * Math.PI * 2;
-    const pr = r * (0.25 + Math.random() * 0.3);
+    const a = rng() * Math.PI * 2;
+    const pr = r * (0.25 + rng() * 0.3);
     palm.position.set(Math.cos(a) * pr, 1.5, Math.sin(a) * pr);
-    const lean = (Math.random() - 0.5) * 0.5;
+    const lean = (rng() - 0.5) * 0.5;
     const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.3, 6, 6), MAT.trunk);
     trunk.position.y = 3;
     trunk.rotation.z = lean;
@@ -616,10 +673,10 @@ islands.push(port);
 function scatterIslands() {
   let attempts = 0;
   while (islands.length < ISLAND_COUNT + 1 && attempts++ < 500) {
-    const a = Math.random() * Math.PI * 2;
-    const d = 220 + Math.random() * (WORLD_SIZE - 350);
+    const a = rng() * Math.PI * 2;
+    const d = 220 + rng() * (WORLD_SIZE - 350);
     const x = Math.cos(a) * d, z = Math.sin(a) * d;
-    const r = 26 + Math.random() * 22;
+    const r = 26 + rng() * 22;
     if (islands.every(p => Math.hypot(p.x - x, p.z - z) > p.r + r + 160)) {
       islands.push(buildIsland(x, z, r));
     }
@@ -636,7 +693,7 @@ function spawnTreasure(island) {
   if (island.treasure) {
     scene.remove(island.treasure.group);
   }
-  const a = Math.random() * Math.PI * 2;
+  const a = rng() * Math.PI * 2;
   const d = island.r * 0.7; // near the shore so the ship can get close enough
   const tx = island.x + Math.cos(a) * d;
   const tz = island.z + Math.sin(a) * d;
@@ -669,7 +726,7 @@ for (const isl of islands) if (!isl.isPort) spawnTreasure(isl);
 
 // ---------- Extraction point ----------
 const extraction = (() => {
-  const a = Math.random() * Math.PI * 2;
+  const a = rng() * Math.PI * 2;
   const d = WORLD_SIZE * 0.75;
   const x = Math.cos(a) * d, z = Math.sin(a) * d;
   const g = new THREE.Group();
@@ -724,7 +781,6 @@ function spawnEnemy() {
   e.sailLevel = 2;
   enemies.push(e);
 }
-for (let i = 0; i < ENEMY_COUNT; i++) spawnEnemy();
 
 // ---------- Input ----------
 const keys = {};
@@ -824,7 +880,13 @@ const hud = {
   compassStrip: document.getElementById('compass-strip'),
   overlay: document.getElementById('overlay'),
   overlaySub: document.getElementById('overlay-sub'),
+  soloBtn: document.getElementById('solo-btn'),
+  mpBtn: document.getElementById('mp-btn'),
   startBtn: document.getElementById('start-btn'),
+  nameInput: document.getElementById('name-input'),
+  leaderboard: document.getElementById('leaderboard'),
+  lbList: document.getElementById('lb-list'),
+  lbCount: document.getElementById('lb-count'),
 };
 
 // build compass strip (three copies for wraparound)
@@ -845,6 +907,12 @@ function showMessage(text, dur = 2.5) {
   hud.message.textContent = text;
   hud.message.classList.add('show');
   msgTimer = dur;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
 }
 
 // ---------- Shop / upgrades ----------
@@ -1028,7 +1096,7 @@ function drawMinimap(t) {
     mmCtx.fill();
   }
 
-  // enemies
+  // AI enemies (solo)
   mmCtx.fillStyle = '#ff3b30';
   for (const e of enemies) {
     if (e.dead || e.sinking > 0) continue;
@@ -1036,6 +1104,18 @@ function drawMinimap(t) {
     mmCtx.beginPath();
     mmCtx.arc(x, y, 2.5, 0, Math.PI * 2);
     mmCtx.fill();
+  }
+
+  // other players (multiplayer)
+  if (mode === 'mp') {
+    mmCtx.fillStyle = '#9fd7ff';
+    for (const r of net.remotes.values()) {
+      if (r.ship.dead || r.ship.sinking > 0) continue;
+      const [x, y] = toMap(r.ship.pos.x, r.ship.pos.z);
+      mmCtx.beginPath();
+      mmCtx.arc(x, y, 2.5, 0, Math.PI * 2);
+      mmCtx.fill();
+    }
   }
 
   // player arrow
@@ -1053,13 +1133,241 @@ function drawMinimap(t) {
   }
 }
 
+// ---------- Network (multiplayer) ----------
+const net = {
+  ws: null, id: null, connected: false,
+  remotes: new Map(), // id -> remote player record
+  sendTimer: 0,
+};
+let mode = 'solo';
+
+const PIRATE_NAMES = ['黑胡子', '红胡子', '独眼龙', '老船长', '海狼', '风暴之子', '金牙', '夜行者'];
+function randomName() {
+  return PIRATE_NAMES[Math.floor(Math.random() * PIRATE_NAMES.length)] + Math.floor(Math.random() * 100);
+}
+
+function netSend(obj) {
+  if (net.ws && net.ws.readyState === 1) net.ws.send(JSON.stringify(obj));
+}
+
+function connectMP(name) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}`);
+  net.ws = ws;
+  hud.overlaySub.textContent = '连接服务器中…';
+  ws.onopen = () => netSend({ t: 'join', name });
+  ws.onmessage = ev => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    handleNet(msg);
+  };
+  ws.onclose = () => {
+    net.connected = false;
+    if (mode === 'mp' && running) showMessage('与服务器断开连接…', 5);
+  };
+  ws.onerror = () => {
+    hud.overlaySub.textContent = '无法连接到服务器——请用 node server.js 启动';
+  };
+}
+
+function makeNameTag(text) {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 64;
+  const ctx = c.getContext('2d');
+  ctx.font = 'bold 34px "Trebuchet MS", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.strokeStyle = 'rgba(0,0,0,.85)';
+  ctx.lineWidth = 6;
+  ctx.strokeText(text, 128, 44);
+  ctx.fillStyle = '#ffe9a8';
+  ctx.fillText(text, 128, 44);
+  const tex = new THREE.CanvasTexture(c);
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false }));
+  sp.scale.set(10, 2.5, 1);
+  return sp;
+}
+
+function createRemote(p) {
+  const ship = new Ship({
+    remote: true, x: p.x, z: p.z, heading: p.heading,
+    cannons: p.cannons, scale: p.scale, maxHp: p.maxHp,
+  });
+  ship.sailLevel = p.sailLevel;
+  const tag = makeNameTag(p.name || 'Pirate');
+  tag.position.set(0, 12 / p.scale, 0);
+  ship.mesh.add(tag);
+  return {
+    id: p.id, name: p.name, ship, tag,
+    tx: p.x, tz: p.z, th: p.heading, tsail: p.sailLevel,
+    cls: p.cls, cannons: p.cannons, scale: p.scale,
+    gold: 0, sunk: 0, seen: true,
+  };
+}
+
+function updateRemotes(dt, t) {
+  for (const r of net.remotes.values()) {
+    const ship = r.ship;
+    if (ship.dead) continue;
+    if (ship.sinking > 0) { ship.update(dt, t); continue; }
+    const k = Math.min(1, dt * 8);
+    ship.pos.x += (r.tx - ship.pos.x) * k;
+    ship.pos.z += (r.tz - ship.pos.z) * k;
+    let dh = ((r.th - ship.heading + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+    ship.heading += dh * k;
+    ship.sailLevel = r.tsail;
+    ship.applyWaveRide(t);
+    ship.updateSailVisual(dt);
+  }
+}
+
+function handleNet(msg) {
+  switch (msg.t) {
+    case 'welcome':
+      net.id = msg.id;
+      net.connected = true;
+      player.pos.set(msg.x, 0, msg.z);
+      hud.overlay.classList.add('hidden');
+      hud.leaderboard.classList.remove('hidden');
+      running = true;
+      showMessage('欢迎来到 Sea of Rouge！', 3);
+      break;
+
+    case 'snap': {
+      for (const p of msg.players) {
+        if (p.id === net.id) {
+          // server-authoritative hp (but don't override while we're sinking)
+          if (player.sinking <= 0) player.hp = p.hp;
+          continue;
+        }
+        let r = net.remotes.get(p.id);
+        if (!r) {
+          r = createRemote(p);
+          net.remotes.set(p.id, r);
+        }
+        r.tx = p.x; r.tz = p.z; r.th = p.heading; r.tsail = p.sailLevel;
+        r.gold = p.gold; r.sunk = p.sunk; r.name = p.name;
+        if (r.cls !== p.cls) {
+          r.cls = p.cls; r.cannons = p.cannons; r.scale = p.scale;
+          r.ship.rebuild({ cannons: p.cannons, scale: p.scale });
+          r.tag.position.set(0, 12 / p.scale, 0);
+          r.ship.mesh.add(r.tag);
+        }
+        r.seen = true;
+      }
+      // remove stale remotes
+      for (const [id, r] of net.remotes) {
+        if (!r.seen) {
+          scene.remove(r.ship.mesh);
+          net.remotes.delete(id);
+        } else {
+          r.seen = false;
+        }
+      }
+      // leaderboard
+      const rows = msg.players.slice().sort((a, b) => b.gold - a.gold).slice(0, 5);
+      hud.lbList.innerHTML = rows.map(p =>
+        `<li class="${p.id === net.id ? 'me' : ''}">${escapeHtml(p.name)} — 💰${p.gold}</li>`
+      ).join('');
+      hud.lbCount.textContent = `在线 ${msg.players.length} 名海盗`;
+      break;
+    }
+
+    case 'fire': {
+      // another player fired: render the volley locally (server does hit detection)
+      const r = net.remotes.get(msg.owner);
+      const ownerShip = r ? r.ship : null;
+      for (const b of msg.balls) {
+        cannonballs.push(new Cannonball(
+          b.x, b.y, b.z, new THREE.Vector3(b.vx, b.vy, b.vz), ownerShip || player
+        ));
+      }
+      if (r) spawnMuzzleFlash(r.ship);
+      break;
+    }
+
+    case 'hit': {
+      spawnHitEffect(msg.x, msg.y, msg.z);
+      if (msg.target === net.id) {
+        player.hp = msg.hp;
+        showMessage('船体被击中！我们正在进水！');
+      } else if (msg.by === net.id) {
+        showMessage('🎯 命中敌船！', 1.2);
+      }
+      break;
+    }
+
+    case 'sink': {
+      if (msg.id === net.id) {
+        player.sinking = 0.001;
+        hideTrajectory();
+        charging = false;
+        chargeEl.classList.remove('show');
+        showMessage('💀 你的船被击沉了！即将重生…', 3);
+      } else {
+        const r = net.remotes.get(msg.id);
+        if (r) r.ship.sinking = 0.001;
+        if (msg.by === net.id) {
+          sunkCount++;
+          gold += 100;
+          showMessage(`💀 击沉 ${r ? r.name : '敌船'}！+100 金币`);
+        } else if (r) {
+          showMessage(`💀 ${r.name} 的船沉没了`, 2);
+        }
+      }
+      break;
+    }
+
+    case 'respawn': {
+      if (msg.id === net.id) {
+        player.sinking = 0;
+        player.dead = false;
+        player.hp = msg.hp;
+        player.pos.set(msg.x, 0, msg.z);
+        player.mesh.rotation.set(0, player.heading, 0);
+        player.speed = 0;
+        player.sailLevel = 0;
+        if (!player.mesh.parent) scene.add(player.mesh);
+        showMessage('⚓ 新船下水，重新出发！');
+      } else {
+        const r = net.remotes.get(msg.id);
+        if (r) {
+          if (r.ship.dead) {
+            scene.remove(r.ship.mesh);
+            r.ship = new Ship({
+              remote: true, x: msg.x, z: msg.z,
+              cannons: r.cannons, scale: r.scale, maxHp: msg.hp,
+            });
+            r.ship.mesh.add(r.tag);
+          } else {
+            r.ship.sinking = 0;
+            r.ship.pos.set(msg.x, 0, msg.z);
+            r.ship.mesh.rotation.set(0, r.ship.heading, 0);
+          }
+          r.tx = msg.x; r.tz = msg.z;
+        }
+      }
+      break;
+    }
+  }
+}
+
 // ---------- Game state ----------
 let running = false;
 
-hud.startBtn.addEventListener('click', () => {
-  hud.overlay.classList.add('hidden');
-  running = true;
-});
+function startGame(selected) {
+  mode = selected;
+  if (mode === 'mp') {
+    const name = (hud.nameInput.value || '').trim() || randomName();
+    connectMP(name);
+  } else {
+    hud.overlay.classList.add('hidden');
+    running = true;
+    for (let i = 0; i < ENEMY_COUNT; i++) spawnEnemy();
+  }
+}
+
+hud.soloBtn.addEventListener('click', () => startGame('solo'));
+hud.mpBtn.addEventListener('click', () => startGame('mp'));
 
 function endGame(win) {
   running = false;
@@ -1067,7 +1375,10 @@ function endGame(win) {
   hud.overlay.querySelector('h2').textContent = win
     ? `成功撤离！带走 ${gold} 金币，击沉 ${sunkCount} 艘敌船。传奇海盗就是你！`
     : `Yer ship rests with Davy Jones. 最终收获：${gold} 金币。`;
-  hud.startBtn.textContent = '再次启航 Sail Again';
+  hud.soloBtn.style.display = 'none';
+  hud.mpBtn.style.display = 'none';
+  hud.nameInput.style.display = 'none';
+  hud.startBtn.style.display = 'inline-block';
   hud.overlaySub.textContent = '点击按钮开始新的航程';
   hud.overlay.classList.remove('hidden');
   hud.startBtn.onclick = () => location.reload();
@@ -1081,7 +1392,7 @@ function nearExtraction() {
   return Math.hypot(player.pos.x - extraction.x, player.pos.z - extraction.z) < 26;
 }
 
-// ---------- Enemy AI ----------
+// ---------- Enemy AI (solo mode) ----------
 function updateEnemy(e, dt) {
   if (e.dead || e.sinking > 0) return;
   const dx = player.pos.x - e.pos.x;
@@ -1132,7 +1443,7 @@ function collideIslands(ship) {
       const push = (minD - d) / d;
       ship.pos.x += dx * push;
       ship.pos.z += dz * push;
-      if (ship.speed > 4 && !ship.enemy) {
+      if (ship.speed > 4 && !ship.enemy && mode === 'solo') {
         ship.damage(5);
         showMessage('Ye ran aground! Hull damaged! 搁浅了，船体受损！');
       }
@@ -1165,6 +1476,20 @@ function tryDig() {
     scene.remove(found.tr.group);
     spawnTreasure(found.isl);
   }, 4000);
+}
+
+// ---------- Solo-mode cannonball damage ----------
+function damageShipSolo(tgt, dmg, byPlayer, silent = false) {
+  const wasAlive = tgt.hp > 0;
+  tgt.damage(dmg);
+  if (tgt === player) {
+    if (!silent) showMessage('船体被击中！我们正在进水！');
+    if (wasAlive && player.hp <= 0) setTimeout(() => endGame(false), 2500);
+  } else if (wasAlive && tgt.hp <= 0 && byPlayer) {
+    sunkCount++;
+    gold += 50;
+    showMessage('💀 击沉敌船！+50 金币');
+  }
 }
 
 // ---------- Main loop ----------
@@ -1205,9 +1530,19 @@ function tick() {
         charging = false;
         hideTrajectory();
         chargeEl.classList.remove('show');
-        player.fireBroadside(cannonballs, chargePower());
+        if (player.fireBroadside(cannonballs, chargePower()) && mode === 'mp') {
+          netSend({
+            t: 'fire',
+            damage: player.cannonDamage,
+            balls: player.lastFired.map(b => ({
+              x: b.mesh.position.x, y: b.mesh.position.y, z: b.mesh.position.z,
+              vx: b.vel.x, vy: b.vel.y, vz: b.vel.z,
+            })),
+          });
+        }
       }
     }
+
     if (keys['KeyF']) {
       keys['KeyF'] = false;
       if (nearPort()) openShop();
@@ -1218,44 +1553,67 @@ function tick() {
     // --- update ships ---
     player.update(dt, t);
     collideIslands(player);
-    for (const e of enemies) {
-      updateEnemy(e, dt);
-      e.update(dt, t);
-      collideIslands(e);
-    }
-
-    // respawn dead enemies
-    for (let i = enemies.length - 1; i >= 0; i--) {
-      if (enemies[i].dead) { enemies.splice(i, 1); spawnEnemy(); }
+    if (mode === 'solo') {
+      for (const e of enemies) {
+        updateEnemy(e, dt);
+        e.update(dt, t);
+        collideIslands(e);
+      }
+      // respawn dead enemies
+      for (let i = enemies.length - 1; i >= 0; i--) {
+        if (enemies[i].dead) { enemies.splice(i, 1); spawnEnemy(); }
+      }
+    } else {
+      updateRemotes(dt, t);
+      // report state at 10 Hz
+      net.sendTimer -= dt;
+      if (net.sendTimer <= 0 && net.connected) {
+        net.sendTimer = 0.1;
+        netSend({
+          t: 'state',
+          x: player.pos.x, y: player.pos.y, z: player.pos.z,
+          heading: player.heading, speed: player.speed, sailLevel: player.sailLevel,
+          gold, sunk: sunkCount,
+          cls: currentClass,
+          scale: SHIP_CLASSES[currentClass].scale,
+          cannons: SHIP_CLASSES[currentClass].cannons,
+          maxHp: player.maxHp,
+        });
+      }
     }
 
     // --- cannonballs ---
     for (let i = cannonballs.length - 1; i >= 0; i--) {
       const cb = cannonballs[i];
-      if (!cb.update(dt, t)) {
+      const res = cb.update(dt, t);
+      if (res !== true) {
+        // near-miss splash damage (solo only; server handles it in MP)
+        if (res === 'water' && mode === 'solo') {
+          const p = cb.mesh.position;
+          const targets = cb.owner === player ? enemies : [player];
+          for (const tgt of targets) {
+            if (tgt.dead || tgt.sinking > 0) continue;
+            if (Math.hypot(tgt.pos.x - p.x, tgt.pos.z - p.z) < NEAR_MISS_RADIUS * tgt.shipScale) {
+              damageShipSolo(tgt, NEAR_MISS_DAMAGE, cb.owner === player, true);
+            }
+          }
+        }
         scene.remove(cb.mesh);
         cannonballs.splice(i, 1);
         continue;
       }
-      // hit ships
-      const targets = cb.owner === player ? enemies : [player];
-      for (const tgt of targets) {
-        if (tgt.dead || tgt.sinking > 0) continue;
-        const d = cb.mesh.position.distanceTo(tgt.pos);
-        if (d < 4.5 * tgt.shipScale) {
-          tgt.damage(cb.owner.cannonDamage || 20);
-          spawnSplash(cb.mesh.position.x, cb.mesh.position.z, t);
-          scene.remove(cb.mesh);
-          cannonballs.splice(i, 1);
-          if (tgt === player) {
-            showMessage('船体被击中！我们正在进水！');
-            if (player.hp <= 0) setTimeout(() => endGame(false), 2500);
-          } else if (tgt.hp <= 0) {
-            sunkCount++;
-            gold += 50;
-            showMessage('💀 击沉敌船！+50 金币');
+      // direct OBB hit (solo only; server is authoritative in MP)
+      if (mode === 'solo') {
+        const targets = cb.owner === player ? enemies : [player];
+        for (const tgt of targets) {
+          if (tgt.dead || tgt.sinking > 0) continue;
+          if (cannonballHitsShip(cb.mesh.position, tgt)) {
+            spawnHitEffect(cb.mesh.position.x, cb.mesh.position.y, cb.mesh.position.z);
+            damageShipSolo(tgt, cb.owner.cannonDamage || 20, cb.owner === player);
+            scene.remove(cb.mesh);
+            cannonballs.splice(i, 1);
+            break;
           }
-          break;
         }
       }
     }
